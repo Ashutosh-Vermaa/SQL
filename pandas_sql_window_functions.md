@@ -43,6 +43,11 @@ df["row_number"] = (
 )
 ```
 
+**Parameters explained**
+* `groupby("group")` — this is the `PARTITION BY` equivalent; it splits the data into independent groups so the ranking restarts for each one.
+* `method="first"` — tells `rank()` how to break ties. `"first"` assigns ranks in the order rows appear in the DataFrame, which is exactly what `ROW_NUMBER()` does (no ties allowed).
+* `ascending=False` — mirrors `ORDER BY value DESC`. Use `ascending=True` (the default) for `ORDER BY value ASC`.
+
 **Example:**
 ```text
 group  value  row_number
@@ -75,6 +80,10 @@ df["rank"] = (
       .rank(method="min", ascending=False)
 )
 ```
+
+**Parameters explained**
+* `method="min"` — every row in a tied group gets the lowest rank in that group (e.g. two rows tied for 2nd both get `2`), and the *next* rank skips ahead to account for the tied rows. This is exactly `RANK()`'s "gap after ties" behavior.
+* `ascending=False` — descending order, same role as in `ROW_NUMBER()` above.
 
 **Example:**
 ```text
@@ -111,6 +120,13 @@ df["dense_rank"] = (
       .rank(method="dense", ascending=False)
 )
 ```
+
+**Parameters explained**
+* `method="dense"` — like `"min"`, tied rows share a rank, but the next distinct value's rank increases by only 1 (no gap). This matches `DENSE_RANK()`'s behavior exactly.
+* `ascending=False` — descending order.
+
+**SQL equivalent**
+`DENSE_RANK()` is equivalent to: `rank(method="dense")`
 
 **Example:**
 ```text
@@ -150,6 +166,10 @@ df["prev_value"] = (
 )
 ```
 
+**Parameters explained**
+* `shift(periods)` — `periods` is the number of rows to look back. `1` means "the row directly before this one," matching `LAG(value)` (which defaults to an offset of 1 in SQL).
+* Rows with no prior row in their group (the first row of each partition) get `NaN`, just like SQL returns `NULL` in that case.
+
 **Example:**
 ```text
 group  value  prev_value
@@ -169,6 +189,17 @@ B       30      15
 df.groupby("group")["value"].shift(2)
 ```
 Equivalent to: `LAG(value, 2) OVER (...)`
+
+**LAG with a default value**
+SQL's three-argument form, `LAG(value, 1, 0)`, substitutes `0` instead of `NULL` when there's no previous row. In pandas, chain `fillna()`:
+```python
+df["prev_value_default"] = (
+    df.groupby("group")["value"]
+      .shift(1)
+      .fillna(0)
+)
+```
+`fillna(0)` replaces the `NaN`s produced by `shift()` with the SQL-style default.
 
 ---
 
@@ -191,7 +222,12 @@ df["next_value"] = (
       .shift(-1)
 )
 ```
-`shift(-1)` means "next row".
+
+**Parameters explained**
+* `shift(-1)` — a negative `periods` value looks *forward* instead of backward, so `-1` means "the next row," matching `LEAD(value)`.
+* As with `LAG()`, a `LEAD(value, n, default)` form can be reproduced with `shift(-n).fillna(default)`.
+
+`shift(-1)` means "next row."
 
 ---
 
@@ -214,6 +250,10 @@ df["first_value"] = (
       .transform("first")
 )
 ```
+
+**Parameters explained**
+* `transform("first")` — `"first"` is a built-in aggregation name meaning "the first row encountered per group." Because `transform()` broadcasts the group-level result back to every row, this matches a `PARTITION BY`-only window (no explicit frame).
+* This depends entirely on row order, so make sure the DataFrame is sorted by your intended `ORDER BY` column(s) beforehand (see section 26).
 
 **Example:**
 ```text
@@ -247,6 +287,9 @@ df["last_value"] = (
 )
 ```
 
+**Parameters explained**
+* `transform("last")` — the counterpart to `"first"`; returns the value of the last row in each group and repeats it for every row in that group.
+
 **Example:**
 ```text
 group  value  last_value
@@ -258,9 +301,49 @@ A       40        40
 
 *Note: SQL LAST_VALUE() is affected by the window frame. Pandas transform("last") gives the last value of the group, so the semantics are not always identical.*
 
+**The default-frame gotcha**
+Most SQL engines default an `ORDER BY` window to the frame `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Under that default, `LAST_VALUE()` doesn't actually return the group's true last row — it returns the *current* row (since nothing after "current row" is visible yet). This surprises a lot of people. If that's the behavior you're translating, the pandas equivalent is simply the column itself:
+```python
+df["last_value_default_frame"] = df["value"]
+```
+Only use `transform("last")` when the SQL frame is explicitly widened to `UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (i.e., the whole partition is visible), which is what the example above assumes.
+
 ---
 
-## 8. SUM() OVER (PARTITION BY)
+## 8. NTH_VALUE()
+
+Get the value from a specific (n-th) row within each group.
+
+**SQL**
+```sql
+NTH_VALUE(value, 2) OVER (
+    PARTITION BY group
+    ORDER BY date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+)
+```
+
+**Pandas**
+```python
+df["nth_value"] = (
+    df.groupby("group")["value"]
+      .transform(lambda x: x.iloc[1])
+)
+```
+
+**Parameters explained**
+* `x.iloc[1]` — `iloc` uses 0-based positional indexing, so the SQL `NTH_VALUE(value, 2)` (1-based, "2nd row") corresponds to `x.iloc[1]`. In general, `NTH_VALUE(value, n)` → `x.iloc[n - 1]`.
+* If a group might have fewer than `n` rows, guard against an `IndexError`:
+```python
+df["nth_value"] = (
+    df.groupby("group")["value"]
+      .transform(lambda x: x.iloc[1] if len(x) >= 2 else None)
+)
+```
+
+---
+
+## 9. SUM() OVER (PARTITION BY)
 
 Calculate the total for each group and repeat it for every row.
 
@@ -278,6 +361,9 @@ df["group_sum"] = (
       .transform("sum")
 )
 ```
+
+**Parameters explained**
+* `transform(func)` — `func` can be a string naming a built-in aggregation (`"sum"`, `"mean"`, `"min"`, `"max"`, `"count"`, `"first"`, `"last"`, `"size"`, etc.) or a custom callable. Unlike `agg()`, `transform()` always returns a result with the same number of rows as the input, which is what makes it the natural fit for `PARTITION BY`-only window functions (no `ORDER BY`, no frame).
 
 **Example:**
 ```text
@@ -326,7 +412,7 @@ This is what we generally want from a window function.
 
 ---
 
-## 9. AVG() OVER (PARTITION BY)
+## 10. AVG() OVER (PARTITION BY)
 
 Calculate the average for each group.
 
@@ -345,9 +431,12 @@ df["group_avg"] = (
 )
 ```
 
+**Parameters explained**
+* `"mean"` — the aggregation name for average. Like `"sum"`, it's computed per group and broadcast back to every row in that group.
+
 ---
 
-## 10. MIN() OVER (PARTITION BY)
+## 11. MIN() OVER (PARTITION BY)
 
 **SQL**
 ```sql
@@ -364,9 +453,12 @@ df["group_min"] = (
 )
 ```
 
+**Parameters explained**
+* `"min"` — smallest value per group, broadcast to every row.
+
 ---
 
-## 11. MAX() OVER (PARTITION BY)
+## 12. MAX() OVER (PARTITION BY)
 
 **SQL**
 ```sql
@@ -383,9 +475,12 @@ df["group_max"] = (
 )
 ```
 
+**Parameters explained**
+* `"max"` — largest value per group, broadcast to every row.
+
 ---
 
-## 12. COUNT() OVER (PARTITION BY)
+## 13. COUNT() OVER (PARTITION BY)
 
 Count non-null values within each group.
 
@@ -404,6 +499,9 @@ df["group_count"] = (
 )
 ```
 
+**Parameters explained**
+* `"count"` — counts non-null entries per group only (mirrors `COUNT(column)`, which ignores `NULL`s).
+
 **Count all rows**
 For SQL:
 ```sql
@@ -418,13 +516,15 @@ df["group_count"] = (
       .transform("size")
 )
 ```
+* `"size"` — counts every row per group regardless of null values (mirrors `COUNT(*)`).
+
 The distinction is similar to:
 *   `COUNT(column)`  -> ignores NULL
 *   `COUNT(*)`       -> counts rows
 
 ---
 
-## 13. Running SUM
+## 14. Running SUM
 
 Calculate a cumulative sum within each group.
 
@@ -445,6 +545,10 @@ df["running_sum"] = (
 )
 ```
 
+**Parameters explained**
+* `cumsum()` takes no window-size argument — it always accumulates from the start of each group up to the current row, which is exactly the `UNBOUNDED PRECEDING AND CURRENT ROW` frame.
+* By default it propagates `NaN`s once encountered; pass `skipna=False` explicitly only if you want that behavior (it's actually the default — use `skipna=True`, the default, to ignore `NaN`s while accumulating).
+
 **Example:**
 ```text
 group  value  running_sum
@@ -461,7 +565,7 @@ B       30       65
 
 ---
 
-## 14. Running AVG
+## 15. Running AVG
 
 Calculate the cumulative average within each group.
 
@@ -483,6 +587,10 @@ df["running_avg"] = (
 )
 ```
 
+**Parameters explained**
+* `expanding()` — creates a window that grows to include every row from the start of the group up to (and including) the current row, matching the default `ORDER BY`-only frame. It optionally accepts `min_periods` (default `1`) to control how many observations are required before returning a non-NaN result.
+* `.reset_index(level=0, drop=True)` — `expanding()`/`rolling()` on a grouped Series return a `MultiIndex` (group key + original index). This drops the group-key level so the result aligns back onto the original DataFrame's index.
+
 Other useful cumulative operations:
 ```python
 df.groupby("group")["value"].expanding().sum()
@@ -493,7 +601,7 @@ df.groupby("group")["value"].expanding().max()
 
 ---
 
-## 15. Rolling SUM
+## 16. Rolling SUM
 
 Calculate the sum over a fixed-size moving window.
 For example, current row + previous 2 rows:
@@ -517,6 +625,10 @@ df["rolling_sum"] = (
 )
 ```
 
+**Parameters explained**
+* `rolling(window)` — `window=3` means "3 rows total" (current + 2 preceding), matching `2 PRECEDING AND CURRENT ROW`. In general, `N PRECEDING AND CURRENT ROW` → `rolling(N + 1)`.
+* By default, `rolling()` requires the full window to be present before it returns a value — earlier rows that don't have enough history return `NaN`.
+
 For:
 `A: 10, 20, 20, 40`
 the result is:
@@ -537,6 +649,8 @@ df["rolling_sum"] = (
       .reset_index(level=0, drop=True)
 )
 ```
+* `min_periods=1` — allows the calculation to run with as few as 1 observation, so the first couple of rows in each group get a partial-window result instead of `NaN`. This is closer to how SQL's `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` behaves at the start of a partition (it just uses however many preceding rows exist).
+
 Result:
 ```text
 10    10
@@ -547,7 +661,7 @@ Result:
 
 ---
 
-## 16. Rolling AVG
+## 17. Rolling AVG
 
 **SQL**
 ```sql
@@ -568,9 +682,12 @@ df["rolling_avg"] = (
 )
 ```
 
+**Parameters explained**
+* Same `window=3` / `min_periods=1` logic as the rolling sum above, just paired with `.mean()` instead of `.sum()`.
+
 ---
 
-## 17. NTILE()
+## 18. NTILE()
 
 Divide rows within each group into approximately equal-sized buckets.
 
@@ -596,11 +713,17 @@ df["quartile"] = (
       )
 )
 ```
+
+**Parameters explained**
+* `x.rank(method="first")` — `qcut()` needs strictly ordered, tie-free input to split evenly; ranking first (breaking ties by row order) avoids `qcut` raising an error on duplicate bin edges.
+* `pd.qcut(data, q, labels=False)` — `q=4` requests quartiles (4 buckets); `labels=False` returns integer bucket indices (`0`–`3`) instead of interval labels.
+* `+ 1` — SQL's `NTILE()` buckets are 1-indexed, so this shifts pandas' 0-indexed buckets to match.
+
 This divides each group into approximately equal-sized buckets.
 
 ---
 
-## 18. PERCENT_RANK()
+## 19. PERCENT_RANK()
 
 **SQL**
 ```sql
@@ -619,6 +742,10 @@ df["percent_rank"] = (
 )
 ```
 
+**Parameters explained**
+* `pct=True` — returns ranks as a fraction between 0 and 1 (rank divided by group size) instead of an integer rank.
+* `method="min"` — tie-handling, same as in the `RANK()` section. Note this is an *approximation*: `rank(pct=True)` divides by the group's row count, whereas SQL's `PERCENT_RANK()` divides by `(count - 1)`, so the two only match exactly when there are no ties and group sizes are large.
+
 For strict SQL-equivalent behavior:
 ```python
 df["percent_rank"] = (
@@ -630,10 +757,38 @@ df["percent_rank"] = (
       )
 )
 ```
+* `(rank - 1) / (count - 1)` — this is `PERCENT_RANK()`'s exact formula: it rescales ranks so the lowest value is always `0` and the highest is always `1`.
+* `if x.count() > 1 else 0` — guards against division by zero when a group has only one row (SQL defines `PERCENT_RANK()` as `0` in that case).
 
 ---
 
-## 19. Difference from Previous Row
+## 20. CUME_DIST()
+
+Calculate the cumulative distribution (fraction of rows with a value less than or equal to the current row's value).
+
+**SQL**
+```sql
+CUME_DIST() OVER (
+    PARTITION BY group
+    ORDER BY value
+)
+```
+
+**Pandas**
+```python
+df["cume_dist"] = (
+    df.groupby("group")["value"]
+      .rank(pct=True, method="max")
+)
+```
+
+**Parameters explained**
+* `pct=True` — same as in `PERCENT_RANK()`, converts ranks to a 0–1 fraction.
+* `method="max"` — the key difference from `PERCENT_RANK()`: tied rows all receive the *highest* rank among the tied group before converting to a percentage, which matches `CUME_DIST()`'s definition ("fraction of rows with value ≤ this row's value," so ties are all counted together).
+
+---
+
+## 21. Difference from Previous Row
 
 A common SQL pattern is:
 
@@ -653,6 +808,10 @@ df["change"] = (
 )
 ```
 
+**Parameters explained**
+* `shift(1)` — same as in the `LAG()` section; the previous row's value within the group.
+* Subtracting it from the raw column reproduces `value - LAG(value)` directly, row for row.
+
 **Result:**
 ```text
 group  value  change
@@ -669,7 +828,7 @@ B       30       15
 
 ---
 
-## 20. Percentage Change from Previous Row
+## 22. Percentage Change from Previous Row
 
 **SQL**
 Conceptually:
@@ -687,9 +846,13 @@ df["pct_change"] = (
 )
 ```
 
+**Parameters explained**
+* `pct_change(periods=1)` — `periods` (default `1`) controls how many rows back the comparison is made against, same idea as `shift()`'s `periods`. `periods=2` would compare against two rows prior.
+* Internally this is `(current - previous) / previous`, exactly the SQL formula above, computed within each group.
+
 ---
 
-## 21. Running MAX
+## 23. Running MAX
 
 **SQL**
 ```sql
@@ -707,9 +870,12 @@ df["running_max"] = (
 )
 ```
 
+**Parameters explained**
+* `cummax()` — like `cumsum()`, it has no window-size argument; it always tracks the running maximum from the start of the group through the current row (`UNBOUNDED PRECEDING AND CURRENT ROW`).
+
 ---
 
-## 22. Running MIN
+## 24. Running MIN
 
 **SQL**
 ```sql
@@ -727,9 +893,12 @@ df["running_min"] = (
 )
 ```
 
+**Parameters explained**
+* `cummin()` — the running-minimum counterpart to `cummax()`.
+
 ---
 
-## 23. Running COUNT
+## 25. Running COUNT
 
 **SQL**
 ```sql
@@ -747,6 +916,10 @@ df["running_count"] = (
 )
 ```
 
+**Parameters explained**
+* `cumcount()` — returns a 0-based running count of rows seen so far within each group, so `+ 1` converts it to the 1-based count that `COUNT(*) OVER (ORDER BY ...)` produces.
+* `cumcount(ascending=False)` — pass `ascending=False` to count *down* from the group's total instead (useful for "rows remaining" style calculations).
+
 **Result:**
 ```text
 group  running_count
@@ -762,7 +935,7 @@ B           4
 
 ---
 
-## 24. Conditional Window Calculations
+## 26. Conditional Window Calculations
 
 SQL often combines a window function with CASE WHEN.
 
@@ -783,6 +956,10 @@ df["conditional_value"] = df["value"].where(
     0
 )
 ```
+
+**Parameters explained**
+* `Series.where(cond, other)` — keeps the original value wherever `cond` is `True`, and replaces it with `other` wherever `cond` is `False`. This is the inverse of how `CASE WHEN` reads: `WHERE cond, keep it; ELSE, use other`.
+
 Then:
 ```python
 df["conditional_sum"] = (
@@ -800,10 +977,11 @@ df["conditional_sum"] = (
       .transform("sum")
 )
 ```
+* `.groupby(df["group"])` — grouping directly by an external Series (rather than a column name on the same frame) is handy when chaining operations like this, since `.where()` returns a standalone Series that's no longer attached to `df`.
 
 ---
 
-## 25. Multiple Partition Columns
+## 27. Multiple Partition Columns
 
 SQL can partition by multiple columns:
 
@@ -819,6 +997,9 @@ SUM(value) OVER (
 df.groupby(["group", "category"])["value"].transform("sum")
 ```
 
+**Parameters explained**
+* `groupby([...])` — passing a list of column names partitions by the combination of all of them, exactly like listing multiple columns after `PARTITION BY`.
+
 The same applies to ranking:
 ```python
 df["rank"] = (
@@ -829,7 +1010,7 @@ df["rank"] = (
 
 ---
 
-## 26. Ordering Before Window Operations
+## 28. Ordering Before Window Operations
 
 SQL explicitly specifies ordering:
 ```sql
@@ -848,6 +1029,11 @@ df["prev_value"] = (
       .shift(1)
 )
 ```
+
+**Parameters explained**
+* `sort_values([...])` — sorts by the listed columns in order, matching `ORDER BY group, date`. This step is what makes `shift()`, `cumsum()`, `rolling()`, etc. line up with the correct "previous"/"next" rows.
+* Note: `groupby()` itself has a separate `sort` parameter (default `True`), which controls whether *group keys* come out in sorted order in the result — it does **not** sort rows *within* each group. Row order within a group is preserved from the input DataFrame, which is why sorting beforehand is still required.
+* For reproducible tie-breaking, consider `df.sort_values([...], kind="stable")` — pandas' default sort isn't guaranteed stable for all algorithms, and a stable sort ensures rows that are tied on your sort columns keep their original relative order.
 
 This is particularly important for:
 *   `shift()`
@@ -870,6 +1056,7 @@ This is particularly important for:
 | `LEAD()` | `groupby().shift(-1)` |
 | `FIRST_VALUE()` | `groupby().transform("first")` |
 | `LAST_VALUE()` | `groupby().transform("last")` |
+| `NTH_VALUE()` | `groupby().transform(lambda x: x.iloc[n-1])` |
 | `SUM() OVER(PARTITION BY)` | `groupby().transform("sum")` |
 | `AVG() OVER(PARTITION BY)` | `groupby().transform("mean")` |
 | `MIN() OVER(PARTITION BY)` | `groupby().transform("min")` |
@@ -883,6 +1070,7 @@ This is particularly important for:
 | `Rolling SUM()` | `groupby().rolling().sum()` |
 | `Rolling AVG()` | `groupby().rolling().mean()` |
 | `PERCENT_RANK()` | `groupby().rank(pct=True)` |
+| `CUME_DIST()` | `groupby().rank(pct=True, method="max")` |
 | `NTILE()` | `groupby().transform(lambda...)` |
 
 ---
@@ -906,6 +1094,7 @@ df.groupby("group")["value"].rank(method="dense")
 # ROW_NUMBER()
 df.groupby("group")["value"].rank(method="first")
 ```
+The `method` parameter is what changes the behavior — `"min"` leaves gaps after ties, `"dense"` doesn't, and `"first"` forbids ties altogether by breaking them on row order.
 
 ### 2. Previous / Next Row
 Use `shift()`:
@@ -916,6 +1105,7 @@ df.groupby("group")["value"].shift(1)
 # LEAD()
 df.groupby("group")["value"].shift(-1)
 ```
+`shift()`'s single argument is a signed offset: positive looks backward (`LAG`), negative looks forward (`LEAD`).
 
 ### 3. Group-Level Value Repeated on Every Row
 Use `transform()`:
@@ -932,6 +1122,7 @@ df.groupby("group")["value"].transform("min")
 # MAX()
 df.groupby("group")["value"].transform("max")
 ```
+`transform()` always returns one output row per input row, which is what lets a group-level aggregate be "spread back out" onto every row — the pandas analogue of a `PARTITION BY`-only window.
 
 ### 4. Running / Rolling Calculations
 For cumulative calculations:
@@ -941,11 +1132,14 @@ df.groupby("group")["value"].cummax()
 df.groupby("group")["value"].cummin()
 df.groupby("group").cumcount()
 ```
+These take no window-size parameter — they always run from the start of the group to the current row.
+
 For moving windows:
 ```python
 df.groupby("group")["value"].rolling(3).sum()
 df.groupby("group")["value"].rolling(3).mean()
 ```
+`rolling(window)` takes a fixed window size (`window`), plus an optional `min_periods` to allow partial windows at the edges of each group.
 
 ---
 
